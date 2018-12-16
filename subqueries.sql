@@ -70,8 +70,3 @@ select county, count(*) from
 	group by a.county
 	order by count(*) desc;
 	
-/* What are top 5 counties in terms of mL per capita? 
-How do they compare to the counties you recommend for the pilot program? */
-/* What percentage of sales per county are over $100? What are the top 5 counties? */
-/* What were the top 5 categories of liquor sold (based on number of sales) 
-in the five most populous counties? */
