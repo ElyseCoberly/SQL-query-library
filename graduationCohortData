@@ -1,0 +1,92 @@
+WITH cohort2019sr AS (
+SELECT s.personID, s.grade, s.gender, s.raceEthnicity, s.enrollmentID, s.calendarID, s.endStatus, s.schoolID,
+ROW_NUMBER() OVER(PARTITION BY s.personID ORDER BY ISNULL(s.endDate, '05/20/2019') DESC) AS [enrollmentNum],
+CASE WHEN s.endStatus = '90' OR s.endStatus = '93' THEN 1 ELSE 0 END AS [graduated]
+FROM s
+WHERE endYear = 2019
+AND grade = '12'
+AND serviceType = 'P'
+AND endStatus IN ('90','93','40',NULL)
+ )
+, studentDemos AS (
+SELECT DISTINCT c19.*, e.migrant, e.specialEdStatus, lep.lepServiceTypeID, 
+CASE WHEN pos.eligibility IN ('F','R') THEN 1 ELSE 0 END AS [FRAM]
+FROM cohort2019sr c19
+INNER JOIN e ON e.enrollmentID = c19.enrollmentID
+LEFT JOIN lep ON lep.personID = c19.personID
+	AND lep.endDate BETWEEN '07/01/2018' AND '06/30/2019'
+LEFT JOIN pos ON pos.personID = c19.personID 
+	AND pos.endYear = e.endYear AND pos.eligibility IN ('F','R')
+	)
+, gradTests AS (
+SELECT sd.personID, ts.date, ISNULL(ts.rawScore,ts.scaleScore) AS [score],ts.result,
+t.testID, t.parentID, t.[name], t.code, t.[type], 
+ROW_NUMBER() OVER(PARTITION BY sd.personID, ts.testID ORDER BY ISNULL(ts.rawscore, ts.scalescore) DESC) AS [rowNum]
+FROM studentDemos sd
+INNER JOIN ts ON ts.personID = sd.personID --no date limits for 12th grade pulls
+INNER JOIN t ON t.testID = ts.testID
+WHERE t.sat = 1 OR t.psat = 1 OR t.act=1 OR (t.[name] LIKE 'AP%' AND t.[name] NOT LIKE 'apply%')
+)
+, commSvc AS ( 
+SELECT DISTINCT sd.personID, SUM(CAST(cs.[value] AS numeric)) AS 'totalServHours'
+FROM studentDemos sd
+INNER JOIN CustomStudent cs ON cs.personID = sd.personID AND cs.attributeID = 209
+GROUP BY sd.personID
+)
+, totalCredits AS (
+SELECT DISTINCT sd.personID, SUM(tc.creditsEarned) AS [totalCredits]
+FROM studentDemos sd
+INNER JOIN tc ON tc.personID = sd.personID
+GROUP BY sd.personID
+)
+, athletes AS (
+SELECT DISTINCT sd.personID,
+CASE WHEN fa.assignmentID IS NOT NULL THEN 1 ELSE 0 END AS [athlete] 
+FROM studentDemos sd
+INNER JOIN fa On fa.personID = sd.personID AND fa.calendarID = sd.calendarID
+	AND fa.feeID IN (SELECT feeID FROM Fee WHERE type = 'S')
+)
+, CRcourses AS (
+SELECT tco.personID, COUNT(*) AS [CRcourses]
+FROM tco
+WHERE tco.grade >= '09' 
+AND courseNumber LIKE 'cr-%'
+GROUP BY tco.personID
+)
+, CTEcourses AS (
+SELECT DISTINCT personID, SUM(creditsAttempted) AS [CTEcourses]
+FROM tcr
+WHERE standardID = 44
+GROUP BY personID
+)
+, APcourses AS (
+SELECT DISTINCT personID, COUNT(*) AS [APcourses]
+FROM tco
+WHERE grade >= '09' AND courseName LIKE 'AP %'
+GROUP BY personID
+)
+, SATscores AS (
+SELECT s.personID, CASE WHEN ts.testID = 3135 THEN 'SATeng' ELSE 'SATmath' END AS 'SATtype',ts.result
+FROM s
+INNER JOIN ts ON ts.personID = s.personID AND ts.testID IN (3135,3136)
+WHERE s.endStatus IN ('90','93','40',NULL)
+AND s.endYear = 2019
+AND s.serviceType = 'P'
+)
+
+SELECT DISTINCT sd.personID, sd.grade, sd.gender, sd.raceEthnicity, 
+sd.schoolID, sd.graduated,sd.migrant, sd.specialEdStatus, sd.lepServiceTypeID, sd.FRAM,
+ap.APcourses, cte.CTEcourses, cr.CRcourses, tc.totalCredits, cs.totalServHours, ath.athlete, gpa.cumGpa, vasa.daysAbsent,
+sate.result AS 'SATengResult', satm.result AS 'SATmathResult'
+FROM studentDemos sd
+LEFT JOIN APcourses ap ON ap.personID = sd.personID
+LEFT JOIN gpa ON gpa.personID = sd.personID AND gpa.calendarID = sd.calendarID
+LEFT JOIN vasa ON vasa.personID = sd.personID AND vasa.calendarID = sd.calendarID
+LEFT JOIN CTEcourses cte ON cte.personID = sd.personID
+LEFT JOIN totalCredits tc ON tc.personID = sd.personID
+LEFT JOIN CRcourses cr ON cr.personID = sd.personID
+LEFT JOIN commSvc cs ON cs.personID = sd.personID
+LEFT JOIN athletes ath ON ath.personID = sd.personID
+LEFT JOIN SATscores sate ON sate.personID = sd.personID AND sate.SATtype = 'sateng'
+LEFT JOIN SATscores satm ON satm.personID = sd.personID AND satm.SATtype = 'satmath'
+ORDER BY sd.personID
