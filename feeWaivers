@@ -1,0 +1,265 @@
+/*
+Fee Waiver Daily Script - Testing Draft
+written by Elyse Coberly, Feb 2020
+--Set up for tracking into NewFeeWaiverTestTable on 3/3/2020
+*/
+
+	DECLARE @endYearLabel CHAR(5) = (SELECT label FROM sy WHERE active = 1);
+    DECLARE @endYear SMALLINT = (SELECT endYear FROM sy WHERE active = 1);
+    DECLARE @prevEndYear SMALLINT = (SELECT DISTINCT @endYear - 1 FROM sy);
+    DECLARE @today DATE = GETDATE();
+    DECLARE @todayMinusOneMonth DATE = CONVERT(DATE, DATEADD(DD, -30, GETDATE()));
+    DECLARE @firstDayOfCurSchoolYear DATE = (SELECT CONVERT(DATE, startDate) FROM sy WHERE active = 1);
+    DECLARE @lastDayOfSchoolCurYear DATE = (SELECT CONVERT(DATE, endDate) FROM sy WHERE endDate IS NOT NULL AND endYear = @endYear);
+    DECLARE @lastDayOfSchoolPrevYear DATE = (SELECT CONVERT(DATE, endDate) FROM sy WHERE endDate IS NOT NULL AND endYear = @prevEndYear);
+    DECLARE @prevEndYearLabel CHAR(5) = (SELECT label FROM schoolYear WHERE endYear = @prevEndYear)
+	DECLARE @mainStructureID INT = (SELECT structureID FROM ss WHERE [name] = 'MAIN' AND calendarID = 
+								(SELECT calendarID FROM ca WHERE endYear = @endYear AND schoolID = 16));
+
+--IF OBJECT_ID('tempdb..NewFeeWaiverTestTable') IS NOT NULL DROP TABLE NewFeeWaiverTestTable;
+
+--student F/R eligibility and sharing permissions as of today
+WITH currentPermission AS
+(
+SELECT DISTINCT
+elig.eligibilityID,
+elig.eligibility,
+elig.personID,
+elig.startDate,
+elig.endDate,
+elper.permissionID,
+cd.code AS 'permissionCode'
+FROM elig
+	LEFT JOIN elper ON elper.eligibilityID = elig.eligibilityID
+	INNER JOIN fp ON elper.permissionID = fp.permissionID
+	INNER JOIN cd ON cd.value = fp.permissionName
+WHERE elig.eligibility IN ('F','R')
+	AND GETDATE() BETWEEN elig.startDate AND elig.endDate
+	AND elper.share = 1
+)
+
+--students often have more than one eligibility during a school year, but permissions only get attached to the most recent one
+, currPermPrevElig AS
+(
+SELECT
+pos.eligibilityID,
+pos.eligibility,
+pos.personID,
+pos.startDate,
+pos.endDate
+FROM pos
+WHERE personID IN (SELECT personID FROM currentPermission)
+	AND eligibility IN ('F','R')
+	AND endYear = @endYear --should we set this to exempt old years?
+)
+--students who become eligible within the first 20 operating days of the school year will have all fees waived from the beginning of the school year
+, BOYgraceEligible AS
+(
+	SELECT DISTINCT elig.personID,
+	startDate,
+	endDate,
+	eligibility,
+	elper.permissionID,
+	share
+	FROM elig
+		INNER JOIN elper ON elper.eligibilityID = elig.eligibilityID
+	WHERE eligibility IN ('F','R')
+	AND elig.endYear = @endYear
+	AND share = 1
+	AND CAST(startDate AS DATE) BETWEEN 
+		DATEADD(day,1,@firstDayofCurSchoolYear) AND dbo.fn_getNthOperatingDate(@firstDayOfCurSchoolYear,@mainStructureID,20)
+	)
+
+--determine most recent student enrollment
+, numberedEnroll AS
+(
+	SELECT DISTINCT s.personID,
+	s.calendarID,
+	s.structureID,
+	s.enrollmentID,
+	s.startdate,
+	ROW_NUMBER() OVER (PARTITION by personID ORDER BY startDate DESC) as 'RowNum'	
+	FROM s
+	WHERE s.endYear = @endYear
+	AND s.serviceType = 'P'
+	AND s.stateGrade <> 004 --preschoolers not included
+)
+
+--students whose current enrollment began after the BOY grace period; 
+--if these students become eligible within 20 operating days after their most recent enrollment, they have fees waived back to their date of enrollment
+, lateStart AS (
+SELECT DISTINCT 
+ne.personID,
+ne.calendarID, 
+ne.startdate [enrollmentStart],
+cp.eligibility, 
+cp.startDate [eligStart],
+cp.endDate [eligEnd],
+cp.permissionID,
+cp.permissionCode
+FROM ne
+INNER JOIN cp ON cp.personID = ne.personID
+WHERE RowNum = 1
+AND CAST(cp.startDate AS DATE) > dbo.fn_getNthOperatingDate(@firstDayOfCurSchoolYear,@mainStructureID,20)
+AND CAST(cp.startDate AS DATE) <= dbo.fn_getNthOperatingDate(ne.startDate,ne.structureID,20)
+)
+
+--current year exemptable fees that have not been exempted or voided or adjusted
+, FeeInfo AS
+(
+	SELECT fa.personID
+		, fa.assignmentID
+		, fa.calendarID
+		, cal.name as calendarName
+		, cal.endYear
+		, f.feeID
+		, f.name as feeName
+		, f.type as feeType
+		, fa.dueDate
+		, fa.exempt
+		, fa.amount
+		, fa.comments
+		, fa.createdDate
+		, fa.createdByID
+		, cd.code
+		, cd.name
+		, cd.value
+		, fp.permissionID
+		, fa.dateExempted
+	FROM fa
+		INNER JOIN f on fa.feeID = f.feeID
+		INNER JOIN cal on fa.calendarID = cal.calendarID
+		INNER JOIN cd on f.type = cd.code AND cd.attributeID = 13 and cd.active = 1
+		INNER JOIN fp ON cd.[value] = fp.permissionName
+		LEFT JOIN fv on fv.assignmentID = fa.assignmentID AND fv.adjustmentID IS NULL AND fv.paymentID IS NULL
+		LEFT JOIN fad ON fad.assignmentID = fa.assignmentID
+	WHERE cal.endYear = @endYear
+		AND fv.voidID IS NULL 			
+		AND fad.adjustmentID IS NULL
+		AND (f.schoolID NOT IN (1,2,3,4,5,27,29,36,40,41,42,44) OR f.schoolID IS NULL) --charters and other schools not managed by district
+		AND (fa.exempt = 0 OR fa.exempt IS NULL)
+		AND f.type IN ('A','C','E','S','T','TE') --athletics, course, enrollment, sports, transportation, technology
+)
+
+--all payments
+, Payments AS
+(
+	SELECT fa.assignmentID
+		, fa.personID
+		, fa.calendarID
+		, fa.feeID
+		, fa.amount as assignedAmount
+		, fc.amount as creditAmount
+		, fp.paymentID
+		, fp.amount as totalPaymentAmount
+		, fp.createdDate as paymentDate
+	FROM fa
+		INNER JOIN cal on fa.calendarID = cal.calendarID
+		INNER JOIN fc on fc.assignmentID = fa.assignmentID
+		INNER JOIN fp on fc.paymentID = fp.paymentID
+		LEFT JOIN ft on ft.paymentID = fp.paymentID AND ft.amount = fc.amount
+		LEFT JOIN fv on  fv.paymentID = fp.paymentID AND (fv.assignmentID IS NULL OR fv.assignmentID = fa.assignmentID)
+	WHERE cal.endYear = @endYear
+		AND fc.amount IS NOT NULL 
+		AND fv.voidID IS NULL
+)
+SELECT a.*, GETDATE() AS 'recordCreated' --INTO NewFeeWaiverTestTable 
+FROM (
+
+	--current permissions eligible unpaid fees
+	SELECT DISTINCT
+		cp.personID,
+		cp.startDate AS 'eligStartDate',
+		cp.endDate AS 'eligEndDate',
+		cp.eligibility,
+		fi.assignmentID,
+		fi.calendarID,
+		fi.feeID,
+		fi.feeName,
+		fi.comments,
+		fi.feeType,
+		fi.amount,
+		fi.createdDate,
+		p.paymentID,
+		p.creditAmount
+
+	FROM  cp
+		INNER JOIN  fi ON cp.personID = fi.personID AND cp.permissionID = fi.permissionID
+		LEFT JOIN  p ON p.assignmentID = fi.assignmentID AND p.personID = cp.personID
+	WHERE CAST(fi.createdDate AS DATE) BETWEEN cp.startDate AND cp.endDate
+
+		UNION
+
+	--fees incurred during BOY grace period
+	SELECT DISTINCT
+		bge.personID,
+		bge.startDate AS 'eligStartDate',
+		bge.endDate AS 'eligEndDate',
+		bge.eligibility,
+		fi.assignmentID,
+		fi.calendarID,
+		fi.feeID,
+		fi.feeName,
+		fi.comments,
+		fi.feeType,
+		fi.amount,
+		fi.createdDate,
+		p.paymentID,
+		p.creditAmount
+	
+	FROM  bge
+		INNER JOIN  fi ON bge.personID = fi.personID AND bge.permissionID = fi.permissionID
+		LEFT JOIN  p ON p.assignmentID = fi.assignmentID AND p.personID = bge.personID
+	WHERE CAST(fi.createdDate AS DATE) BETWEEN @firstDayOfCurSchoolYear AND CAST(DATEADD(day,-1,bge.startDate) AS DATE)
+
+		UNION
+
+	--fees incurred during mid-year enrollment grade period
+	SELECT DISTINCT 
+		ls.personID,
+		--ls.enrollmentStart,
+		ls.eligStart AS 'eligStartDate',
+		ls.eligEnd AS 'eligEndDate',
+		ls.eligibility,
+		fi.assignmentID,
+		fi.calendarID,
+		fi.feeID,
+		fi.feeName,
+		fi.comments,
+		fi.feeType,
+		fi.amount,
+		fi.createdDate,
+		p.paymentID,
+		p.creditAmount
+		
+	FROM  ls
+		INNER JOIN  fi ON ls.personID = fi.personID AND ls.permissionID = fi.permissionID
+		LEFT JOIN  p ON p.assignmentID = fi.assignmentID AND p.personID = ls.personID
+	WHERE CAST(fi.createdDate AS DATE) BETWEEN CAST(DATEADD(day,-7,ls.enrollmentStart) AS DATE) AND CAST(ls.eligEnd AS DATE) 
+	--fees are often assessed a few days before a student's official start date, so setting createdDate as between enrollment date and 
+	--eligibility start miss quite a few; however, fees may exist from much earlier in the school year if a student leaves and returns
+
+		UNION
+
+	--permissions attached to current eligibility record, but fees fall into earlier ones without permissions attached
+	SELECT DISTINCT pre.personID,
+		pre.startDate AS 'eligStartDate',
+		pre.endDate AS 'eligEndDate',
+		pre.eligibility,
+		fi.assignmentID,
+		fi.calendarID,
+		fi.feeID,
+		fi.feeName,
+		fi.comments,
+		fi.feeType,
+		fi.amount,
+		fi.createdDate,
+		p.paymentID,
+		p.creditAmount
+
+	FROM  fi
+	INNER JOIN  pre ON pre.personID = fi.personID AND CAST(fi.createdDate AS DATE) BETWEEN CAST(pre.startDate AS DATE) AND CAST(pre.endDate AS DATE)
+	INNER JOIN  cp ON cp.personID = fi.personID AND fi.feeType = cp.permissionCode
+	LEFT JOIN  p ON p.assignmentID = fi.assignmentID AND p.personID = fi.personID
+	) a
+	WHERE a.assignmentID NOT IN (SELECT assignmentID FROM NewFeeWaiverTestTable)
